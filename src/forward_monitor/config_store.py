@@ -37,6 +37,8 @@ class ChannelRecord:
     active: bool
     last_message_id: str | None
     added_at: datetime | None
+    is_forum: bool = False
+    guild_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -187,6 +189,12 @@ class ConfigStore:
                     "UPDATE channels SET added_at=? WHERE added_at IS NULL OR added_at=''",
                     (timestamp,),
                 )
+        if "is_forum" not in columns:
+            cur.execute("ALTER TABLE channels ADD COLUMN is_forum INTEGER DEFAULT 0")
+            columns.add("is_forum")
+        if "guild_id" not in columns:
+            cur.execute("ALTER TABLE channels ADD COLUMN guild_id TEXT")
+            columns.add("guild_id")
 
     # ------------------------------------------------------------------
     # Basic settings
@@ -436,6 +444,8 @@ class ConfigStore:
         telegram_thread_id: int | None = None,
         last_message_id: str | None = None,
         added_at: datetime | None = None,
+        is_forum: bool = False,
+        guild_id: str | None = None,
     ) -> ChannelRecord:
         timestamp = added_at or datetime.now(timezone.utc)
         with closing(self._conn.cursor()) as cur:
@@ -443,8 +453,8 @@ class ConfigStore:
                 (
                     "INSERT INTO channels("
                     "discord_id, telegram_chat_id, label, telegram_thread_id, "
-                    "last_message_id, added_at"
-                    ") VALUES(?, ?, ?, ?, ?, ?)"
+                    "last_message_id, added_at, is_forum, guild_id"
+                    ") VALUES(?, ?, ?, ?, ?, ?, ?, ?)"
                 ),
                 (
                     discord_id,
@@ -453,6 +463,8 @@ class ConfigStore:
                     str(int(telegram_thread_id)) if telegram_thread_id is not None else None,
                     last_message_id,
                     timestamp.isoformat(),
+                    1 if is_forum else 0,
+                    guild_id,
                 ),
             )
             channel_id_raw = cur.lastrowid
@@ -471,6 +483,8 @@ class ConfigStore:
             active=True,
             last_message_id=last_message_id,
             added_at=timestamp,
+            is_forum=is_forum,
+            guild_id=guild_id,
         )
 
     def remove_channel(self, discord_id: str) -> bool:
@@ -485,7 +499,8 @@ class ConfigStore:
             cur.execute(
                 (
                     "SELECT id, discord_id, telegram_chat_id, telegram_thread_id, "
-                    "label, active, last_message_id, added_at FROM channels ORDER BY discord_id"
+                    "label, active, last_message_id, added_at, is_forum, guild_id "
+                    "FROM channels ORDER BY discord_id"
                 )
             )
             rows = cur.fetchall()
@@ -499,6 +514,8 @@ class ConfigStore:
                 active=bool(row["active"]),
                 last_message_id=str(row["last_message_id"]) if row["last_message_id"] else None,
                 added_at=_parse_timestamp(row["added_at"]),
+                is_forum=bool(row["is_forum"]) if row["is_forum"] is not None else False,
+                guild_id=str(row["guild_id"]) if row["guild_id"] else None,
             )
             for row in rows
         ]
@@ -508,7 +525,8 @@ class ConfigStore:
             cur.execute(
                 (
                     "SELECT id, discord_id, telegram_chat_id, telegram_thread_id, "
-                    "label, active, last_message_id, added_at FROM channels WHERE discord_id=?"
+                    "label, active, last_message_id, added_at, is_forum, guild_id "
+                    "FROM channels WHERE discord_id=?"
                 ),
                 (discord_id,),
             )
@@ -528,6 +546,8 @@ class ConfigStore:
             active=bool(row["active"]),
             last_message_id=str(row["last_message_id"]) if row["last_message_id"] else None,
             added_at=ensured_added_at,
+            is_forum=bool(row["is_forum"]) if row["is_forum"] is not None else False,
+            guild_id=str(row["guild_id"]) if row["guild_id"] else None,
         )
 
     def set_channel_option(self, channel_id: int, option_key: str, option_value: str) -> None:
@@ -592,6 +612,24 @@ class ConfigStore:
         self.set_channel_option(
             channel_id,
             "state.pinned_synced",
+            "true" if synced else "false",
+        )
+
+    def set_known_forum_threads(self, channel_id: int, thread_ids: Iterable[str]) -> None:
+        """Store known thread IDs for a forum channel."""
+        payload = json.dumps(sorted({str(tid) for tid in thread_ids if str(tid)}))
+        self.set_channel_option(channel_id, "state.forum_thread_ids", payload)
+
+    def clear_known_forum_threads(self, channel_id: int) -> None:
+        """Clear forum thread tracking state."""
+        self.delete_channel_option(channel_id, "state.forum_thread_ids")
+        self.delete_channel_option(channel_id, "state.forum_synced")
+
+    def set_forum_synced(self, channel_id: int, *, synced: bool) -> None:
+        """Mark forum as synced after initial thread discovery."""
+        self.set_channel_option(
+            channel_id,
+            "state.forum_synced",
             "true" if synced else "false",
         )
 
@@ -720,7 +758,23 @@ class ConfigStore:
                 f"channel.{record.discord_id}"
             )
             blocked_by_health = health_status == "error" and record.active
-            is_forum = parse_bool(channel_options.get("is_forum"), False)
+
+            # Forum thread state
+            known_thread_ids: set[str] = set()
+            forum_synced = False
+            if record.is_forum:
+                raw_thread_ids = channel_options.get("state.forum_thread_ids")
+                if raw_thread_ids:
+                    try:
+                        parsed = json.loads(raw_thread_ids)
+                        if isinstance(parsed, list):
+                            known_thread_ids = {str(tid) for tid in parsed if tid}
+                    except json.JSONDecodeError:
+                        pass
+                forum_synced = parse_bool(
+                    channel_options.get("state.forum_synced"), False
+                )
+
             configs.append(
                 ChannelConfig(
                     discord_id=record.discord_id,
@@ -741,7 +795,10 @@ class ConfigStore:
                     health_status=health_status,
                     health_message=health_message,
                     blocked_by_health=blocked_by_health,
-                    is_forum=is_forum,
+                    is_forum=record.is_forum,
+                    known_thread_ids=known_thread_ids,
+                    forum_synced=forum_synced,
+                    guild_id=record.guild_id,
                 )
             )
         return configs

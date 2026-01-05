@@ -67,6 +67,9 @@ class ChannelConfig:
     health_message: str | None = None
     blocked_by_health: bool = False
     is_forum: bool = False
+    known_thread_ids: Set[str] = field(default_factory=set)
+    forum_synced: bool = False
+    guild_id: str | None = None
 
     def with_updates(
         self,
@@ -98,6 +101,9 @@ class ChannelConfig:
             health_message=self.health_message,
             blocked_by_health=self.blocked_by_health,
             is_forum=self.is_forum,
+            known_thread_ids=set(self.known_thread_ids),
+            forum_synced=self.forum_synced,
+            guild_id=self.guild_id,
         )
 
 
