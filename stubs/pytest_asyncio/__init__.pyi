@@ -1,0 +1,3 @@
+from typing import Any
+
+def fixture(*args: Any, **kwargs: Any) -> Any: ...
