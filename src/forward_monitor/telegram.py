@@ -1997,66 +1997,29 @@ class TelegramController:
             )
             return
 
-        # Fetch channel info to determine type and guild_id
-        channel_info = None
+        last_message_id: str | None = None
         try:
-            channel_info = await self._discord.fetch_channel_info(discord_id)
+            messages = await self._discord.fetch_messages(discord_id, limit=1)
         except Exception:
             logger.exception(
-                "Не удалось получить информацию о канале %s при создании связки",
+                "Не удалось получить последнее сообщение канала %s при создании связки",
                 discord_id,
             )
-
-        # Check if channel is a forum (type 15 = GUILD_FORUM)
-        is_forum = False
-        guild_id: str | None = None
-        if channel_info:
-            channel_type = channel_info.get("type")
-            is_forum = channel_type == 15
-            guild_id = str(channel_info.get("guild_id")) if channel_info.get("guild_id") else None
-
-        # Validate forum mode requirement
-        if mode_override == "forum" and not is_forum:
-            await self._send_status_notice(
-                ctx,
-                title="Каналы",
-                icon="⚠️",
-                message="Указанный канал не является форумом Discord. Режим forum доступен только для форумных каналов.",
-                message_icon="❗️",
-            )
-            return
-
-        # Auto-detect forum mode if channel is a forum and no mode specified
-        if is_forum and mode_override is None:
-            mode_override = "forum"
-
-        last_message_id: str | None = None
-        if not is_forum:
-            try:
-                messages = await self._discord.fetch_messages(discord_id, limit=1)
-            except Exception:
-                logger.exception(
-                    "Не удалось получить последнее сообщение канала %s при создании связки",
-                    discord_id,
+        else:
+            if messages:
+                latest = max(
+                    messages,
+                    key=lambda msg: (
+                        (int(msg.id), msg.id) if msg.id.isdigit() else (0, msg.id)
+                    ),
                 )
-            else:
-                if messages:
-                    latest = max(
-                        messages,
-                        key=lambda msg: (
-                            (int(msg.id), msg.id) if msg.id.isdigit() else (0, msg.id)
-                        ),
-                    )
-                    last_message_id = latest.id
-
+                last_message_id = latest.id
         record = self._store.add_channel(
             discord_id,
             telegram_chat,
             label,
             telegram_thread_id=thread_id,
             last_message_id=last_message_id,
-            is_forum=is_forum,
-            guild_id=guild_id,
         )
 
         default_mode = (
@@ -2081,13 +2044,10 @@ class TelegramController:
         if mode_to_apply == "messages":
             self._store.clear_known_pinned_messages(record.id)
             self._store.set_pinned_synced(record.id, synced=False)
-        elif mode_to_apply == "forum":
-            mode_label = "форумные темы"
-            # Initial forum threads will be synced on first poll
-            self._store.clear_known_forum_threads(record.id)
-            self._store.set_forum_synced(record.id, synced=False)
-        else:
+            self._store.clear_known_thread_ids(record.id)
+        elif mode_to_apply == "pinned":
             mode_label = "закреплённые сообщения"
+            self._store.clear_known_thread_ids(record.id)
             pinned_messages = None
             if token:
                 try:
@@ -2108,6 +2068,40 @@ class TelegramController:
             else:
                 self._store.set_known_pinned_messages(record.id, [])
                 self._store.set_pinned_synced(record.id, synced=False)
+        elif mode_to_apply == "forum":
+            mode_label = "темы форума"
+            self._store.clear_known_pinned_messages(record.id)
+            # Fetch channel info to get guild_id
+            channel_info = None
+            if token:
+                try:
+                    channel_info = await self._discord.fetch_channel_info(discord_id)
+                except Exception:  # pragma: no cover
+                    logger.exception(
+                        "Не удалось получить информацию о канале %s при создании связки",
+                        discord_id,
+                    )
+            if channel_info and channel_info.guild_id:
+                self._store.set_guild_id(record.id, channel_info.guild_id)
+                # Fetch current threads to initialize known_thread_ids
+                try:
+                    threads = await self._discord.fetch_forum_threads(
+                        discord_id, channel_info.guild_id
+                    )
+                    self._store.set_known_thread_ids(
+                        record.id, [t.id for t in threads]
+                    )
+                    self._store.set_forum_synced(record.id, synced=True)
+                except Exception:  # pragma: no cover
+                    logger.exception(
+                        "Не удалось получить треды форума %s при создании связки",
+                        discord_id,
+                    )
+                    self._store.set_known_thread_ids(record.id, [])
+                    self._store.set_forum_synced(record.id, synced=False)
+            else:
+                self._store.set_known_thread_ids(record.id, [])
+                self._store.set_forum_synced(record.id, synced=False)
 
         self._on_change()
         label_display = html.escape(label)
@@ -2125,13 +2119,6 @@ class TelegramController:
                 _panel_bullet(
                     f"Тема: <code>{thread_id}</code>",
                     icon="🧵",
-                )
-            )
-        if is_forum:
-            rows.append(
-                _panel_bullet(
-                    "Форумный канал: темы будут отслеживаться автоматически",
-                    icon="📋",
                 )
             )
         await self._send_panel_message(
@@ -2702,9 +2689,6 @@ class TelegramController:
             "pinned": "pinned",
             "pins": "pinned",
             "pin": "pinned",
-            "forum": "forum",
-            "threads": "forum",
-            "thread": "forum",
         }
         normalized_mode = mode_map.get(mode_key)
         if normalized_mode is None:
@@ -2712,7 +2696,7 @@ class TelegramController:
                 ctx,
                 title="Режим мониторинга",
                 icon="⚠️",
-                message="Допустимые режимы: messages, pinned, forum.",
+                message="Допустимые режимы: messages, pinned.",
                 message_icon="❗️",
             )
             return
@@ -2723,11 +2707,7 @@ class TelegramController:
             description = (
                 "По умолчанию отслеживаются закреплённые сообщения"
                 if normalized_mode == "pinned"
-                else (
-                    "По умолчанию отслеживаются форумные темы"
-                    if normalized_mode == "forum"
-                    else "По умолчанию отслеживаются новые сообщения"
-                )
+                else "По умолчанию отслеживаются новые сообщения"
             )
             await self._send_panel_message(
                 ctx,
@@ -2748,23 +2728,10 @@ class TelegramController:
             )
             return
 
-        # Validate forum mode - only allowed for forum channels
-        if normalized_mode == "forum" and not record.is_forum:
-            await self._send_status_notice(
-                ctx,
-                title="Режим мониторинга",
-                icon="⚠️",
-                message="Режим forum доступен только для форумных каналов Discord.",
-                message_icon="❗️",
-            )
-            return
-
         if normalized_mode == "messages":
             self._store.delete_channel_option(record.id, "monitoring.mode")
             self._store.clear_known_pinned_messages(record.id)
             self._store.set_pinned_synced(record.id, synced=False)
-            self._store.clear_known_forum_threads(record.id)
-            self._store.set_forum_synced(record.id, synced=False)
             self._on_change()
             await self._send_panel_message(
                 ctx,
@@ -2779,29 +2746,7 @@ class TelegramController:
             )
             return
 
-        if normalized_mode == "forum":
-            self._store.set_channel_option(record.id, "monitoring.mode", normalized_mode)
-            self._store.clear_known_pinned_messages(record.id)
-            self._store.set_pinned_synced(record.id, synced=False)
-            self._store.clear_known_forum_threads(record.id)
-            self._store.set_forum_synced(record.id, synced=False)
-            self._on_change()
-            await self._send_panel_message(
-                ctx,
-                title="Режим мониторинга",
-                icon="🎯",
-                rows=[
-                    _panel_bullet(
-                        "Канал переключён на форумные темы.",
-                        icon="✅",
-                    )
-                ],
-            )
-            return
-
         self._store.set_channel_option(record.id, "monitoring.mode", normalized_mode)
-        self._store.clear_known_forum_threads(record.id)
-        self._store.set_forum_synced(record.id, synced=False)
         try:
             pinned_messages = list(
                 await self._discord.fetch_pinned_messages(record.discord_id)

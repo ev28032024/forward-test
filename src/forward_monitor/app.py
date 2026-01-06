@@ -513,8 +513,8 @@ class ForwardMonitorApp:
         if not channel.active or channel.blocked_by_health:
             return
 
-        if channel.is_forum:
-            await self._process_forum_channel_inner(
+        if channel.pinned_only:
+            await self._process_pinned_channel_inner(
                 channel,
                 discord_client,
                 telegram_api,
@@ -523,8 +523,8 @@ class ForwardMonitorApp:
             )
             return
 
-        if channel.pinned_only:
-            await self._process_pinned_channel_inner(
+        if channel.is_forum:
+            await self._process_forum_channel_inner(
                 channel,
                 discord_client,
                 telegram_api,
@@ -827,116 +827,91 @@ class ForwardMonitorApp:
         telegram_rate: RateLimiter,
         runtime: RuntimeOptions,
     ) -> None:
-        """Process a forum channel by detecting new threads and forwarding first messages."""
+        """Monitor forum channel for new threads and forward their first messages."""
         if not channel.active or channel.blocked_by_health:
             return
 
         if not channel.guild_id:
             logger.warning(
-                "Форум канал %s не имеет guild_id, пропускаем",
-                channel.discord_id,
+                "Пропуск форума %s: не указан guild_id", channel.discord_id
             )
             return
 
-        # Fetch all active threads in the guild
         try:
-            all_threads = await discord_client.fetch_active_threads(channel.guild_id)
+            threads = await discord_client.fetch_forum_threads(
+                channel.discord_id, channel.guild_id
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception(
-                "Ошибка при получении активных тредов для форума %s",
+                "Ошибка при получении тредов форума %s",
                 channel.discord_id,
             )
             await asyncio.sleep(1.0)
             return
 
-        # Filter threads that belong to this forum channel (parent_id matches)
-        forum_threads = [
-            t for t in all_threads
-            if str(t.get("parent_id") or "") == channel.discord_id
-        ]
+        current_ids = {thread.id for thread in threads}
 
-        current_thread_ids = {str(t.get("id") or "") for t in forum_threads if t.get("id")}
-        previous_known = set(channel.known_thread_ids)
-
-        # On first sync, just remember current threads without forwarding
+        # First sync - just remember current threads, don't forward
         if not channel.forum_synced:
             if channel.storage_id is not None:
-                self._store.set_known_forum_threads(channel.storage_id, current_thread_ids)
+                self._store.set_known_thread_ids(channel.storage_id, current_ids)
                 self._store.set_forum_synced(channel.storage_id, synced=True)
-                channel.known_thread_ids = set(current_thread_ids)
+                channel.known_thread_ids = set(current_ids)
                 channel.forum_synced = True
             else:
                 channel.forum_synced = True
             return
 
-        # Find new threads
-        new_thread_ids = current_thread_ids - previous_known
-        if not new_thread_ids:
-            # Update known threads even if no new ones (threads may have been archived)
-            if current_thread_ids != previous_known and channel.storage_id is not None:
-                self._store.set_known_forum_threads(channel.storage_id, current_thread_ids)
-                channel.known_thread_ids = set(current_thread_ids)
+        new_ids = current_ids - channel.known_thread_ids
+        if not new_ids:
             return
 
-        # Sort new threads by ID for consistent ordering
+        # Sort threads by ID (chronological order for snowflakes)
         def sort_key(thread_id: str) -> tuple[int, str]:
             return (int(thread_id), thread_id) if thread_id.isdigit() else (0, thread_id)
 
-        engine = FilterEngine(channel.filters)
-        deduplicate_messages = (
-            runtime.deduplicate_messages
-            if channel.deduplicate_inherited
-            else channel.deduplicate_messages
-        )
+        threads_by_id = {thread.id: thread for thread in threads}
+        ordered_new_ids = sorted(new_ids, key=sort_key)
+
         processed_ids: set[str] = set()
         interrupted = False
 
-        for thread_id in sorted(new_thread_ids, key=sort_key):
+        for thread_id in ordered_new_ids:
             if self._refresh_event.is_set():
                 interrupted = True
                 break
 
+            thread = threads_by_id.get(thread_id)
+            if not thread:
+                processed_ids.add(thread_id)
+                continue
+
             # Fetch the first message of the thread
-            await telegram_rate.wait()
             try:
-                first_message = await discord_client.fetch_thread_first_message(thread_id)
+                messages = await discord_client.fetch_messages(thread_id, limit=1)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception(
-                    "Не удалось получить первое сообщение треда %s форума %s",
-                    thread_id,
-                    channel.discord_id,
-                )
-                processed_ids.add(thread_id)
-                continue
-
-            if first_message is None:
-                logger.debug(
-                    "Первое сообщение треда %s пустое, пропускаем",
+                    "Ошибка при получении первого сообщения треда %s",
                     thread_id,
                 )
+                continue
+
+            if not messages:
                 processed_ids.add(thread_id)
                 continue
 
-            # Apply filters
-            decision = engine.evaluate(first_message)
-            if not decision.allowed:
-                processed_ids.add(thread_id)
-                continue
+            # Get the first (oldest) message
+            first_msg = min(messages, key=lambda m: sort_key(m.id))
 
-            # Check for duplicates
-            signature: str | None = None
-            if deduplicate_messages:
-                signature = build_message_signature(first_message)
-                if self._deduplicator.is_duplicate(signature):
-                    processed_ids.add(thread_id)
-                    continue
+            # Format message with thread title
+            formatted = format_discord_message(
+                first_msg, channel, message_kind="forum_thread", thread_name=thread.name
+            )
 
-            # Format and send
-            formatted = format_discord_message(first_message, channel, message_kind="thread")
             await telegram_rate.wait()
             if self._refresh_event.is_set():
                 interrupted = True
@@ -953,11 +928,10 @@ class ForwardMonitorApp:
                 raise
             except Exception:
                 logger.exception(
-                    "Не удалось отправить сообщение треда %s в Telegram чат %s",
+                    "Не удалось отправить сообщение из треда %s в Telegram чат %s",
                     thread_id,
                     channel.telegram_chat_id,
                 )
-                processed_ids.add(thread_id)
                 continue
 
             processed_ids.add(thread_id)
@@ -966,12 +940,12 @@ class ForwardMonitorApp:
         # Update known threads
         if channel.storage_id is not None:
             if interrupted:
-                updated_known = previous_known | processed_ids
+                updated_known = channel.known_thread_ids | processed_ids
             else:
-                updated_known = current_thread_ids
+                updated_known = current_ids
 
             if updated_known != channel.known_thread_ids:
-                self._store.set_known_forum_threads(channel.storage_id, updated_known)
+                self._store.set_known_thread_ids(channel.storage_id, updated_known)
                 channel.known_thread_ids = updated_known
 
     async def _sleep_within(self, runtime: RuntimeOptions) -> None:

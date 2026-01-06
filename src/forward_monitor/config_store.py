@@ -37,8 +37,6 @@ class ChannelRecord:
     active: bool
     last_message_id: str | None
     added_at: datetime | None
-    is_forum: bool = False
-    guild_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -189,12 +187,6 @@ class ConfigStore:
                     "UPDATE channels SET added_at=? WHERE added_at IS NULL OR added_at=''",
                     (timestamp,),
                 )
-        if "is_forum" not in columns:
-            cur.execute("ALTER TABLE channels ADD COLUMN is_forum INTEGER DEFAULT 0")
-            columns.add("is_forum")
-        if "guild_id" not in columns:
-            cur.execute("ALTER TABLE channels ADD COLUMN guild_id TEXT")
-            columns.add("guild_id")
 
     # ------------------------------------------------------------------
     # Basic settings
@@ -444,8 +436,6 @@ class ConfigStore:
         telegram_thread_id: int | None = None,
         last_message_id: str | None = None,
         added_at: datetime | None = None,
-        is_forum: bool = False,
-        guild_id: str | None = None,
     ) -> ChannelRecord:
         timestamp = added_at or datetime.now(timezone.utc)
         with closing(self._conn.cursor()) as cur:
@@ -453,8 +443,8 @@ class ConfigStore:
                 (
                     "INSERT INTO channels("
                     "discord_id, telegram_chat_id, label, telegram_thread_id, "
-                    "last_message_id, added_at, is_forum, guild_id"
-                    ") VALUES(?, ?, ?, ?, ?, ?, ?, ?)"
+                    "last_message_id, added_at"
+                    ") VALUES(?, ?, ?, ?, ?, ?)"
                 ),
                 (
                     discord_id,
@@ -463,8 +453,6 @@ class ConfigStore:
                     str(int(telegram_thread_id)) if telegram_thread_id is not None else None,
                     last_message_id,
                     timestamp.isoformat(),
-                    1 if is_forum else 0,
-                    guild_id,
                 ),
             )
             channel_id_raw = cur.lastrowid
@@ -483,8 +471,6 @@ class ConfigStore:
             active=True,
             last_message_id=last_message_id,
             added_at=timestamp,
-            is_forum=is_forum,
-            guild_id=guild_id,
         )
 
     def remove_channel(self, discord_id: str) -> bool:
@@ -499,8 +485,7 @@ class ConfigStore:
             cur.execute(
                 (
                     "SELECT id, discord_id, telegram_chat_id, telegram_thread_id, "
-                    "label, active, last_message_id, added_at, is_forum, guild_id "
-                    "FROM channels ORDER BY discord_id"
+                    "label, active, last_message_id, added_at FROM channels ORDER BY discord_id"
                 )
             )
             rows = cur.fetchall()
@@ -514,8 +499,6 @@ class ConfigStore:
                 active=bool(row["active"]),
                 last_message_id=str(row["last_message_id"]) if row["last_message_id"] else None,
                 added_at=_parse_timestamp(row["added_at"]),
-                is_forum=bool(row["is_forum"]) if row["is_forum"] is not None else False,
-                guild_id=str(row["guild_id"]) if row["guild_id"] else None,
             )
             for row in rows
         ]
@@ -525,8 +508,7 @@ class ConfigStore:
             cur.execute(
                 (
                     "SELECT id, discord_id, telegram_chat_id, telegram_thread_id, "
-                    "label, active, last_message_id, added_at, is_forum, guild_id "
-                    "FROM channels WHERE discord_id=?"
+                    "label, active, last_message_id, added_at FROM channels WHERE discord_id=?"
                 ),
                 (discord_id,),
             )
@@ -546,8 +528,6 @@ class ConfigStore:
             active=bool(row["active"]),
             last_message_id=str(row["last_message_id"]) if row["last_message_id"] else None,
             added_at=ensured_added_at,
-            is_forum=bool(row["is_forum"]) if row["is_forum"] is not None else False,
-            guild_id=str(row["guild_id"]) if row["guild_id"] else None,
         )
 
     def set_channel_option(self, channel_id: int, option_key: str, option_value: str) -> None:
@@ -615,23 +595,27 @@ class ConfigStore:
             "true" if synced else "false",
         )
 
-    def set_known_forum_threads(self, channel_id: int, thread_ids: Iterable[str]) -> None:
-        """Store known thread IDs for a forum channel."""
+    def set_known_thread_ids(self, channel_id: int, thread_ids: Iterable[str]) -> None:
+        """Store known forum thread IDs for tracking new threads."""
         payload = json.dumps(sorted({str(tid) for tid in thread_ids if str(tid)}))
-        self.set_channel_option(channel_id, "state.forum_thread_ids", payload)
+        self.set_channel_option(channel_id, "state.thread_ids", payload)
 
-    def clear_known_forum_threads(self, channel_id: int) -> None:
+    def clear_known_thread_ids(self, channel_id: int) -> None:
         """Clear forum thread tracking state."""
-        self.delete_channel_option(channel_id, "state.forum_thread_ids")
+        self.delete_channel_option(channel_id, "state.thread_ids")
         self.delete_channel_option(channel_id, "state.forum_synced")
 
     def set_forum_synced(self, channel_id: int, *, synced: bool) -> None:
-        """Mark forum as synced after initial thread discovery."""
+        """Mark forum as synced (initial threads recorded)."""
         self.set_channel_option(
             channel_id,
             "state.forum_synced",
             "true" if synced else "false",
         )
+
+    def set_guild_id(self, channel_id: int, guild_id: str) -> None:
+        """Store guild ID needed for forum thread API calls."""
+        self.set_channel_option(channel_id, "state.guild_id", guild_id)
 
     # ------------------------------------------------------------------
     # Filters
@@ -748,9 +732,15 @@ class ConfigStore:
             channel_options = dict(self.iter_channel_options(record.id))
             channel_formatting = _formatting_from_options(formatting, channel_options)
             filters = default_filters.merge(self._load_filter_config(record.id))
-            pinned_only, known_pinned_ids, pinned_synced = _monitoring_from_options(
-                defaults.get("monitoring", {}), channel_options
-            )
+            (
+                pinned_only,
+                known_pinned_ids,
+                pinned_synced,
+                is_forum,
+                guild_id,
+                known_thread_ids,
+                forum_synced,
+            ) = _monitoring_from_options(defaults.get("monitoring", {}), channel_options)
             raw_deduplicate = channel_options.get("runtime.deduplicate_messages")
             deduplicate_inherited = raw_deduplicate is None
             deduplicate_messages = parse_bool(raw_deduplicate, default_deduplicate)
@@ -758,23 +748,6 @@ class ConfigStore:
                 f"channel.{record.discord_id}"
             )
             blocked_by_health = health_status == "error" and record.active
-
-            # Forum thread state
-            known_thread_ids: set[str] = set()
-            forum_synced = False
-            if record.is_forum:
-                raw_thread_ids = channel_options.get("state.forum_thread_ids")
-                if raw_thread_ids:
-                    try:
-                        parsed = json.loads(raw_thread_ids)
-                        if isinstance(parsed, list):
-                            known_thread_ids = {str(tid) for tid in parsed if tid}
-                    except json.JSONDecodeError:
-                        pass
-                forum_synced = parse_bool(
-                    channel_options.get("state.forum_synced"), False
-                )
-
             configs.append(
                 ChannelConfig(
                     discord_id=record.discord_id,
@@ -792,13 +765,13 @@ class ConfigStore:
                     pinned_only=pinned_only,
                     known_pinned_ids=known_pinned_ids,
                     pinned_synced=pinned_synced,
+                    is_forum=is_forum,
+                    guild_id=guild_id,
+                    known_thread_ids=known_thread_ids,
+                    forum_synced=forum_synced,
                     health_status=health_status,
                     health_message=health_message,
                     blocked_by_health=blocked_by_health,
-                    is_forum=record.is_forum,
-                    known_thread_ids=known_thread_ids,
-                    forum_synced=forum_synced,
-                    guild_id=record.guild_id,
                 )
             )
         return configs
@@ -1018,14 +991,24 @@ def _filter_target(filters: FilterConfig, filter_type: str) -> set[str] | None:
 
 def _monitoring_from_options(
     defaults: dict[str, str], options: dict[str, str]
-) -> tuple[bool, set[str], bool]:
+) -> tuple[bool, set[str], bool, bool, str | None, set[str], bool]:
+    """Parse monitoring options, returning pinned and forum state.
+    
+    Returns:
+        (pinned_only, known_pinned_ids, pinned_synced,
+         is_forum, guild_id, known_thread_ids, forum_synced)
+    """
     default_mode = defaults.get("mode", "messages").strip().lower()
     mode_raw = options.get("monitoring.mode", default_mode)
     mode = str(mode_raw).strip().lower()
     pinned_only = mode == "pinned"
+    is_forum = mode == "forum"
     known_pinned = _parse_known_pinned(options.get("state.pinned_ids"))
     pinned_synced = _parse_bool_option(options.get("state.pinned_synced"))
-    return pinned_only, known_pinned, pinned_synced
+    guild_id = options.get("state.guild_id")
+    known_threads = _parse_known_threads(options.get("state.thread_ids"))
+    forum_synced = _parse_bool_option(options.get("state.forum_synced"))
+    return pinned_only, known_pinned, pinned_synced, is_forum, guild_id, known_threads, forum_synced
 
 
 def _parse_bool_option(value: str | None) -> bool:
@@ -1052,6 +1035,11 @@ def _parse_known_pinned(payload: str | None) -> set[str]:
         if text:
             result.add(text)
     return result
+
+
+def _parse_known_threads(payload: str | None) -> set[str]:
+    """Parse stored thread IDs (same format as pinned)."""
+    return _parse_known_pinned(payload)
 
 
 def _normalize_role_value(value: str) -> str | None:

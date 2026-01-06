@@ -15,10 +15,11 @@ EmbedPayload = Mapping[str, Any]
 AttachmentPayload = Mapping[str, Any]
 
 
-_MESSAGE_KIND_ICONS = {"message": "💬", "pinned": "📌"}
+_MESSAGE_KIND_ICONS = {"message": "💬", "pinned": "📌", "forum_thread": "📝"}
 _MESSAGE_KIND_LABELS = {
     "message": "Новое сообщение",
     "pinned": "Закреплённое сообщение",
+    "forum_thread": "Новая тема",
 }
 _CHANNEL_ICON = "📣"
 _MESSAGE_SEPARATOR = "<b>────── ✦ ──────</b>"
@@ -29,6 +30,7 @@ def format_discord_message(
     channel: ChannelConfig,
     *,
     message_kind: str = "message",
+    thread_name: str | None = None,
 ) -> FormattedTelegramMessage:
     """Convert a Discord message into Telegram text respecting the channel profile."""
 
@@ -42,7 +44,7 @@ def format_discord_message(
     link_block = _build_link_block(message, formatting.show_discord_link)
 
     inner_blocks: list[str] = []
-    header = _build_header(channel.label, message.author_name, message_kind)
+    header = _build_header(channel.label, message.author_name, message_kind, thread_name)
     if header:
         inner_blocks.append(header)
 
@@ -84,7 +86,7 @@ def _normalize_message_kind(kind: str) -> str:
     return lowered if lowered in _MESSAGE_KIND_ICONS else "message"
 
 
-def _build_header(label: str, author: str, kind: str) -> str:
+def _build_header(label: str, author: str, kind: str, thread_name: str | None = None) -> str:
     kind_key = _normalize_message_kind(kind)
     parts: list[str] = []
     if label:
@@ -92,6 +94,9 @@ def _build_header(label: str, author: str, kind: str) -> str:
     icon = _MESSAGE_KIND_ICONS.get(kind_key, "💬")
     kind_label = _MESSAGE_KIND_LABELS.get(kind_key, "Новое сообщение")
     parts.append(f"{icon} <b>{_escape(kind_label)}</b>")
+    # Add thread name for forum threads
+    if thread_name and kind_key == "forum_thread":
+        parts.append(f"🏷️ <b>{_escape(thread_name)}</b>")
     if author:
         parts.append(f"👤 <b>{_escape(author)}</b>")
     return "\n".join(parts)

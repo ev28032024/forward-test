@@ -40,6 +40,28 @@ class ProxyCheckResult:
     status: int | None = None
 
 
+@dataclass(slots=True)
+class ChannelInfo:
+    """Basic channel metadata from Discord API."""
+
+    id: str
+    type: int
+    guild_id: str | None = None
+    name: str | None = None
+
+
+@dataclass(slots=True)
+class ForumThread:
+    """Thread in a Discord forum channel."""
+
+    id: str
+    name: str
+    parent_id: str
+    guild_id: str
+    owner_id: str | None = None
+    created_timestamp: str | None = None
+
+
 class DiscordClient:
     """Thin asynchronous wrapper around the Discord REST API."""
 
@@ -200,6 +222,138 @@ class DiscordClient:
                 return []
         payloads = [payload for payload in data if isinstance(payload, Mapping)]
         return await self._prepare_messages(payloads, channel_id)
+
+    async def fetch_channel_info(self, channel_id: str) -> ChannelInfo | None:
+        """Fetch channel metadata including type and guild_id."""
+        if not self._token:
+            return None
+
+        headers = {
+            "Authorization": self._token,
+            "User-Agent": self._choose_user_agent(),
+            "Accept": "application/json",
+        }
+
+        url = f"{_API_BASE}/channels/{channel_id}"
+        proxy = self._network.discord_proxy_url
+        proxy_auth = self._build_proxy_auth()
+
+        async with self._lock:
+            try:
+                timeout_cfg = aiohttp.ClientTimeout(total=15)
+                async with self._session.get(
+                    url,
+                    headers=headers,
+                    proxy=proxy,
+                    timeout=timeout_cfg,
+                    proxy_auth=proxy_auth,
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            "Discord ответил статусом %s при получении информации о канале %s",
+                            resp.status,
+                            channel_id,
+                        )
+                        return None
+                    data = await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    "Не удалось получить информацию о Discord канале %s: %s",
+                    channel_id,
+                    exc,
+                )
+                return None
+
+        if not isinstance(data, Mapping):
+            return None
+
+        channel_type_raw = data.get("type")
+        try:
+            channel_type = int(str(channel_type_raw))
+        except (TypeError, ValueError):
+            channel_type = 0
+
+        return ChannelInfo(
+            id=str(data.get("id") or channel_id),
+            type=channel_type,
+            guild_id=str(data.get("guild_id")) if data.get("guild_id") else None,
+            name=str(data.get("name") or "") if data.get("name") else None,
+        )
+
+    async def fetch_active_threads(self, guild_id: str) -> Sequence[ForumThread]:
+        """Fetch all active threads in a guild."""
+        if not self._token:
+            return []
+
+        headers = {
+            "Authorization": self._token,
+            "User-Agent": self._choose_user_agent(),
+            "Accept": "application/json",
+        }
+
+        url = f"{_API_BASE}/guilds/{guild_id}/threads/active"
+        proxy = self._network.discord_proxy_url
+        proxy_auth = self._build_proxy_auth()
+
+        async with self._lock:
+            try:
+                timeout_cfg = aiohttp.ClientTimeout(total=15)
+                async with self._session.get(
+                    url,
+                    headers=headers,
+                    proxy=proxy,
+                    timeout=timeout_cfg,
+                    proxy_auth=proxy_auth,
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            "Discord ответил статусом %s при получении тредов гильдии %s",
+                            resp.status,
+                            guild_id,
+                        )
+                        return []
+                    data = await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    "Не удалось получить треды гильдии %s: %s",
+                    guild_id,
+                    exc,
+                )
+                return []
+
+        if not isinstance(data, Mapping):
+            return []
+
+        threads_raw = data.get("threads") or []
+        threads: list[ForumThread] = []
+        for entry in threads_raw:
+            if not isinstance(entry, Mapping):
+                continue
+            thread_id = str(entry.get("id") or "")
+            if not thread_id:
+                continue
+            threads.append(
+                ForumThread(
+                    id=thread_id,
+                    name=str(entry.get("name") or ""),
+                    parent_id=str(entry.get("parent_id") or ""),
+                    guild_id=str(entry.get("guild_id") or guild_id),
+                    owner_id=str(entry.get("owner_id")) if entry.get("owner_id") else None,
+                    created_timestamp=entry.get("thread_metadata", {}).get(
+                        "create_timestamp"
+                    ),
+                )
+            )
+        return threads
+
+    async def fetch_forum_threads(
+        self, forum_channel_id: str, guild_id: str
+    ) -> Sequence[ForumThread]:
+        """Fetch active threads belonging to a specific forum channel."""
+        all_threads = await self.fetch_active_threads(guild_id)
+        return [
+            thread for thread in all_threads if thread.parent_id == forum_channel_id
+        ]
 
     def _choose_user_agent(self) -> str:
         return self._network.discord_user_agent or _DEFAULT_USER_AGENT
@@ -423,160 +577,6 @@ class DiscordClient:
             error=last_error or "Discord отклонил токен. Попробуйте позже.",
             status=last_status,
         )
-
-    async def fetch_channel_info(self, channel_id: str) -> dict[str, Any] | None:
-        """Fetch channel information including type.
-
-        Channel type 15 = GUILD_FORUM.
-        """
-        if not self._token:
-            return None
-
-        headers = {
-            "Authorization": self._token,
-            "User-Agent": self._choose_user_agent(),
-            "Accept": "application/json",
-        }
-
-        url = f"{_API_BASE}/channels/{channel_id}"
-        proxy = self._network.discord_proxy_url
-        proxy_auth = self._build_proxy_auth()
-
-        async with self._lock:
-            try:
-                timeout_cfg = aiohttp.ClientTimeout(total=15)
-                async with self._session.get(
-                    url,
-                    headers=headers,
-                    proxy=proxy,
-                    timeout=timeout_cfg,
-                    proxy_auth=proxy_auth,
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(
-                            "Discord ответил статусом %s при получении информации о канале %s",
-                            resp.status,
-                            channel_id,
-                        )
-                        await resp.read()
-                        return None
-                    data = await resp.json()
-                    if isinstance(data, Mapping):
-                        return dict(data)
-                    return None
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                logger.warning(
-                    "Не удалось получить информацию о канале Discord %s: %s",
-                    channel_id,
-                    exc,
-                )
-                return None
-
-    async def fetch_active_threads(self, guild_id: str) -> Sequence[Mapping[str, Any]]:
-        """Fetch all active threads in a guild.
-
-        Returns a sequence of thread objects.
-        """
-        if not self._token:
-            return []
-
-        headers = {
-            "Authorization": self._token,
-            "User-Agent": self._choose_user_agent(),
-            "Accept": "application/json",
-        }
-
-        url = f"{_API_BASE}/guilds/{guild_id}/threads/active"
-        proxy = self._network.discord_proxy_url
-        proxy_auth = self._build_proxy_auth()
-
-        async with self._lock:
-            try:
-                timeout_cfg = aiohttp.ClientTimeout(total=15)
-                async with self._session.get(
-                    url,
-                    headers=headers,
-                    proxy=proxy,
-                    timeout=timeout_cfg,
-                    proxy_auth=proxy_auth,
-                ) as resp:
-                    if resp.status >= 400:
-                        logger.warning(
-                            "Discord ответил статусом %s при получении активных тредов гильдии %s",
-                            resp.status,
-                            guild_id,
-                        )
-                        await resp.read()
-                        return []
-                    data = await resp.json()
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                logger.warning(
-                    "Не удалось получить активные треды гильдии %s: %s",
-                    guild_id,
-                    exc,
-                )
-                return []
-
-        if not isinstance(data, Mapping):
-            return []
-        threads_raw = data.get("threads") or []
-        return [t for t in threads_raw if isinstance(t, Mapping)]
-
-    async def fetch_thread_first_message(
-        self, thread_id: str
-    ) -> DiscordMessage | None:
-        """Fetch the first (starter) message of a thread."""
-        if not self._token:
-            return None
-
-        headers = {
-            "Authorization": self._token,
-            "User-Agent": self._choose_user_agent(),
-            "Accept": "application/json",
-        }
-
-        # Fetch messages with after=0 to get the earliest message
-        url = f"{_API_BASE}/channels/{thread_id}/messages"
-        params = {"limit": "1", "after": "0"}
-        proxy = self._network.discord_proxy_url
-        proxy_auth = self._build_proxy_auth()
-
-        async with self._lock:
-            try:
-                timeout_cfg = aiohttp.ClientTimeout(total=15)
-                async with self._session.get(
-                    url,
-                    headers=headers,
-                    params=params,
-                    proxy=proxy,
-                    timeout=timeout_cfg,
-                    proxy_auth=proxy_auth,
-                ) as resp:
-                    if resp.status >= 400:
-                        logger.warning(
-                            "Discord ответил статусом %s при получении первого сообщения треда %s",
-                            resp.status,
-                            thread_id,
-                        )
-                        await resp.read()
-                        return None
-                    data = await resp.json()
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                logger.warning(
-                    "Не удалось получить первое сообщение треда %s: %s",
-                    thread_id,
-                    exc,
-                )
-                return None
-
-        if not isinstance(data, list) or not data:
-            return None
-
-        payload = data[0]
-        if not isinstance(payload, Mapping):
-            return None
-
-        return _parse_message(payload, thread_id, {})
 
     async def check_proxy(
         self,

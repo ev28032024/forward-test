@@ -63,13 +63,13 @@ class ChannelConfig:
     pinned_only: bool = False
     known_pinned_ids: Set[str] = field(default_factory=set)
     pinned_synced: bool = False
+    is_forum: bool = False
+    guild_id: str | None = None
+    known_thread_ids: Set[str] = field(default_factory=set)
+    forum_synced: bool = False
     health_status: str = "unknown"
     health_message: str | None = None
     blocked_by_health: bool = False
-    is_forum: bool = False
-    known_thread_ids: Set[str] = field(default_factory=set)
-    forum_synced: bool = False
-    guild_id: str | None = None
 
     def with_updates(
         self,
@@ -97,13 +97,13 @@ class ChannelConfig:
             pinned_only=self.pinned_only,
             known_pinned_ids=set(self.known_pinned_ids),
             pinned_synced=self.pinned_synced,
+            is_forum=self.is_forum,
+            guild_id=self.guild_id,
+            known_thread_ids=set(self.known_thread_ids),
+            forum_synced=self.forum_synced,
             health_status=self.health_status,
             health_message=self.health_message,
             blocked_by_health=self.blocked_by_health,
-            is_forum=self.is_forum,
-            known_thread_ids=set(self.known_thread_ids),
-            forum_synced=self.forum_synced,
-            guild_id=self.guild_id,
         )
 
 
