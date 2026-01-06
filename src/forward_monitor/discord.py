@@ -280,8 +280,10 @@ class DiscordClient:
             name=str(data.get("name") or "") if data.get("name") else None,
         )
 
-    async def fetch_active_threads(self, guild_id: str) -> Sequence[ForumThread]:
-        """Fetch all active threads in a guild."""
+    async def fetch_archived_threads(
+        self, channel_id: str
+    ) -> Sequence[ForumThread]:
+        """Fetch archived public threads for a channel (works with user tokens)."""
         if not self._token:
             return []
 
@@ -291,7 +293,7 @@ class DiscordClient:
             "Accept": "application/json",
         }
 
-        url = f"{_API_BASE}/guilds/{guild_id}/threads/active"
+        url = f"{_API_BASE}/channels/{channel_id}/threads/archived/public"
         proxy = self._network.discord_proxy_url
         proxy_auth = self._build_proxy_auth()
 
@@ -307,16 +309,16 @@ class DiscordClient:
                 ) as resp:
                     if resp.status >= 400:
                         logger.warning(
-                            "Discord ответил статусом %s при получении тредов гильдии %s",
+                            "Discord ответил статусом %s при получении архивных тредов канала %s",
                             resp.status,
-                            guild_id,
+                            channel_id,
                         )
                         return []
                     data = await resp.json()
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 logger.warning(
-                    "Не удалось получить треды гильдии %s: %s",
-                    guild_id,
+                    "Не удалось получить архивные треды канала %s: %s",
+                    channel_id,
                     exc,
                 )
                 return []
@@ -324,6 +326,118 @@ class DiscordClient:
         if not isinstance(data, Mapping):
             return []
 
+        return self._parse_threads_response(data, channel_id)
+
+    async def fetch_forum_threads_via_search(
+        self, forum_channel_id: str, guild_id: str
+    ) -> Sequence[ForumThread]:
+        """Discover forum threads via search API (works with user tokens)."""
+        if not self._token:
+            return []
+
+        headers = {
+            "Authorization": self._token,
+            "User-Agent": self._choose_user_agent(),
+            "Accept": "application/json",
+        }
+
+        # Search for messages in the forum channel to discover thread IDs
+        url = f"{_API_BASE}/guilds/{guild_id}/messages/search"
+        params = {"channel_id": forum_channel_id}
+        proxy = self._network.discord_proxy_url
+        proxy_auth = self._build_proxy_auth()
+
+        async with self._lock:
+            try:
+                timeout_cfg = aiohttp.ClientTimeout(total=15)
+                async with self._session.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    proxy=proxy,
+                    timeout=timeout_cfg,
+                    proxy_auth=proxy_auth,
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            "Discord ответил статусом %s при поиске в форуме %s",
+                            resp.status,
+                            forum_channel_id,
+                        )
+                        return []
+                    data = await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    "Не удалось выполнить поиск в форуме %s: %s",
+                    forum_channel_id,
+                    exc,
+                )
+                return []
+
+        if not isinstance(data, Mapping):
+            return []
+
+        # Extract unique thread IDs from search results
+        messages = data.get("messages") or []
+        seen_threads: dict[str, ForumThread] = {}
+
+        for message_group in messages:
+            if not isinstance(message_group, list):
+                continue
+            for msg in message_group:
+                if not isinstance(msg, Mapping):
+                    continue
+                # Each message has channel_id which is the thread ID
+                thread_id = str(msg.get("channel_id") or "")
+                if not thread_id or thread_id in seen_threads:
+                    continue
+                # Thread info might be in the message or we need to fetch it
+                thread_data = msg.get("thread")
+                if isinstance(thread_data, Mapping):
+                    seen_threads[thread_id] = ForumThread(
+                        id=thread_id,
+                        name=str(thread_data.get("name") or ""),
+                        parent_id=str(thread_data.get("parent_id") or forum_channel_id),
+                        guild_id=guild_id,
+                        owner_id=str(thread_data.get("owner_id")) if thread_data.get("owner_id") else None,
+                        created_timestamp=thread_data.get("thread_metadata", {}).get("create_timestamp"),
+                    )
+                else:
+                    # Create minimal thread info
+                    seen_threads[thread_id] = ForumThread(
+                        id=thread_id,
+                        name="",
+                        parent_id=forum_channel_id,
+                        guild_id=guild_id,
+                        owner_id=None,
+                        created_timestamp=None,
+                    )
+
+        return list(seen_threads.values())
+
+    async def fetch_forum_threads(
+        self, forum_channel_id: str, guild_id: str
+    ) -> Sequence[ForumThread]:
+        """Fetch threads from a forum channel using multiple methods."""
+        # Try search API first (usually works better with user tokens)
+        threads = await self.fetch_forum_threads_via_search(forum_channel_id, guild_id)
+        
+        # Also try archived threads and merge
+        archived = await self.fetch_archived_threads(forum_channel_id)
+        
+        # Merge results, preferring search results for duplicates
+        seen_ids = {t.id for t in threads}
+        for thread in archived:
+            if thread.id not in seen_ids:
+                threads = list(threads) + [thread]
+                seen_ids.add(thread.id)
+        
+        return threads
+
+    def _parse_threads_response(
+        self, data: Mapping[str, Any], default_parent_id: str
+    ) -> list[ForumThread]:
+        """Parse threads from API response."""
         threads_raw = data.get("threads") or []
         threads: list[ForumThread] = []
         for entry in threads_raw:
@@ -336,8 +450,8 @@ class DiscordClient:
                 ForumThread(
                     id=thread_id,
                     name=str(entry.get("name") or ""),
-                    parent_id=str(entry.get("parent_id") or ""),
-                    guild_id=str(entry.get("guild_id") or guild_id),
+                    parent_id=str(entry.get("parent_id") or default_parent_id),
+                    guild_id=str(entry.get("guild_id") or ""),
                     owner_id=str(entry.get("owner_id")) if entry.get("owner_id") else None,
                     created_timestamp=entry.get("thread_metadata", {}).get(
                         "create_timestamp"
@@ -345,15 +459,6 @@ class DiscordClient:
                 )
             )
         return threads
-
-    async def fetch_forum_threads(
-        self, forum_channel_id: str, guild_id: str
-    ) -> Sequence[ForumThread]:
-        """Fetch active threads belonging to a specific forum channel."""
-        all_threads = await self.fetch_active_threads(guild_id)
-        return [
-            thread for thread in all_threads if thread.parent_id == forum_channel_id
-        ]
 
     def _choose_user_agent(self) -> str:
         return self._network.discord_user_agent or _DEFAULT_USER_AGENT
