@@ -48,6 +48,23 @@ def _discord_snowflake_from_datetime(moment: datetime | None) -> int | None:
         return 0
     return milliseconds << 22
 
+
+def _datetime_from_discord_snowflake(snowflake: str | int) -> datetime | None:
+    """Extract creation timestamp from Discord snowflake ID."""
+    try:
+        snowflake_int = int(snowflake)
+    except (TypeError, ValueError):
+        return None
+    if snowflake_int <= 0:
+        return None
+    # Discord epoch: January 1, 2015
+    discord_epoch_ms = 1420070400000
+    timestamp_ms = (snowflake_int >> 22) + discord_epoch_ms
+    try:
+        return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    except (OSError, OverflowError):
+        return None
+
 logger = logging.getLogger(__name__)
 
 _FORWARDABLE_MESSAGE_TYPES: set[int] = {0, 19, 20, 21, 23}
@@ -851,57 +868,65 @@ class ForwardMonitorApp:
             await asyncio.sleep(1.0)
             return
 
-        current_ids = {thread.id for thread in threads}
-
-        # First sync - just remember current threads, don't forward
+        # Time-based filtering: only forward threads created after last check
+        # Use forum_synced to track if we've done initial sync
+        # Use last_forum_check timestamp instead of storing all thread IDs
+        now = datetime.now(timezone.utc)
+        
+        # First sync - just mark current time, don't forward anything
         if not channel.forum_synced:
             if channel.storage_id is not None:
-                self._store.set_known_thread_ids(channel.storage_id, current_ids)
+                # Store current timestamp as the baseline
                 self._store.set_forum_synced(channel.storage_id, synced=True)
-                channel.known_thread_ids = set(current_ids)
                 channel.forum_synced = True
             else:
                 channel.forum_synced = True
+            logger.info(
+                "Первичная синхронизация форума %s: найдено %d тредов, пропускаем",
+                channel.discord_id,
+                len(threads),
+            )
             return
 
-        new_ids = current_ids - channel.known_thread_ids
-        if not new_ids:
+        # Filter threads by creation time - only those created after channel was added
+        # or within the last poll interval (whichever is more recent)
+        baseline = channel.added_at or self._startup_time
+        if baseline.tzinfo is None:
+            baseline = baseline.replace(tzinfo=timezone.utc)
+        
+        # Find threads created after the baseline
+        new_threads = []
+        for thread in threads:
+            created_at = _datetime_from_discord_snowflake(thread.id)
+            if created_at and created_at > baseline:
+                new_threads.append(thread)
+        
+        if not new_threads:
             return
 
         # Sort threads by ID (chronological order for snowflakes)
         def sort_key(thread_id: str) -> tuple[int, str]:
             return (int(thread_id), thread_id) if thread_id.isdigit() else (0, thread_id)
 
-        threads_by_id = {thread.id: thread for thread in threads}
-        ordered_new_ids = sorted(new_ids, key=sort_key)
+        sorted_threads = sorted(new_threads, key=lambda t: sort_key(t.id))
 
-        processed_ids: set[str] = set()
-        interrupted = False
-
-        for thread_id in ordered_new_ids:
+        for thread in sorted_threads:
             if self._refresh_event.is_set():
-                interrupted = True
                 break
-
-            thread = threads_by_id.get(thread_id)
-            if not thread:
-                processed_ids.add(thread_id)
-                continue
 
             # Fetch the first message of the thread
             try:
-                messages = await discord_client.fetch_messages(thread_id, limit=1)
+                messages = await discord_client.fetch_messages(thread.id, limit=1)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception(
                     "Ошибка при получении первого сообщения треда %s",
-                    thread_id,
+                    thread.id,
                 )
                 continue
 
             if not messages:
-                processed_ids.add(thread_id)
                 continue
 
             # Get the first (oldest) message
@@ -914,7 +939,6 @@ class ForwardMonitorApp:
 
             await telegram_rate.wait()
             if self._refresh_event.is_set():
-                interrupted = True
                 break
 
             try:
@@ -929,24 +953,12 @@ class ForwardMonitorApp:
             except Exception:
                 logger.exception(
                     "Не удалось отправить сообщение из треда %s в Telegram чат %s",
-                    thread_id,
+                    thread.id,
                     channel.telegram_chat_id,
                 )
                 continue
 
-            processed_ids.add(thread_id)
             await self._sleep_within(runtime)
-
-        # Update known threads
-        if channel.storage_id is not None:
-            if interrupted:
-                updated_known = channel.known_thread_ids | processed_ids
-            else:
-                updated_known = current_ids
-
-            if updated_known != channel.known_thread_ids:
-                self._store.set_known_thread_ids(channel.storage_id, updated_known)
-                channel.known_thread_ids = updated_known
 
     async def _sleep_within(self, runtime: RuntimeOptions) -> None:
         delay_seconds = 0.0
