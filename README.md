@@ -36,7 +36,7 @@ pip install -e .[dev]
 - `/revoke <id|@user>` — отозвать права (админ).
 
 ### Каналы
-- `/add_channel <discord_id> <telegram_chat[:thread]> <название> [messages|pinned]` — создать связку, задать видимое имя и сразу выбрать режим мониторинга (админ).
+- `/add_channel <discord_id> <telegram_chat[:thread]> <название> [messages|pinned|forum]` — создать связку, задать видимое имя и сразу выбрать режим мониторинга (админ).
 - `/remove_channel <discord_id>` — удалить связку (админ).
 - `/list_channels` — список активных связок (админ).
 
@@ -53,7 +53,7 @@ pip install -e .[dev]
 - `/set_disable_preview <discord_id|all> <on|off>` — управлять предпросмотром ссылок (админ).
 - `/set_max_length <discord_id|all> <число>` — ограничить длину сообщения и разбивать текст (админ).
 - `/set_attachments <discord_id|all> <summary|links>` — выбрать стиль блока вложений (админ).
-- `/set_monitoring <discord_id|all> <messages|pinned>` — выбрать режим мониторинга (новые или закреплённые сообщения) (админ).
+- `/set_monitoring <discord_id|all> <messages|pinned|forum>` — выбрать режим мониторинга (новые/закреплённые сообщения/темы форума) (админ).
 - `/add_filter <discord_id|all> <тип> <значение>` — добавить фильтр (`whitelist`, `blacklist`, `allowed_senders`, `blocked_senders`, `allowed_types`, `blocked_types`, `allowed_roles`, `blocked_roles`) (админ).
 - `/clear_filter <discord_id|all> <тип> [значение]` — очистить фильтр целиком или по значению (админ).
 
